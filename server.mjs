@@ -4,17 +4,56 @@ import { classify } from "./mock-ai.mjs";
 
 const html = await readFile(new URL("./index.html", import.meta.url));
 
+const TOPICS = new Set(["delivery", "pricing", "other"]);
+const MODEL_TIMEOUT_MS = 300;
+
 function json(response, status, body) {
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body));
 }
 
-async function handleTriage(request, response) {
+function invalidInput(response) {
+  return json(response, 400, { status: "invalid_input" });
+}
+
+function manualReview(response) {
+  return json(response, 200, { status: "manual_review", topic: null, draft: null });
+}
+
+async function readText(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
-  const { text } = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  const result = JSON.parse(await classify(text));
-  return json(response, 200, { status: "ready", ...result });
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function handleTriage(request, response) {
+  let text;
+  try {
+    const body = JSON.parse(await readText(request));
+    text = body?.text;
+  } catch {
+    return invalidInput(response);
+  }
+
+  if (typeof text !== "string" || text.trim() === "") {
+    return invalidInput(response);
+  }
+
+  let result;
+  try {
+    const raw = await classify(text, { signal: AbortSignal.timeout(MODEL_TIMEOUT_MS) });
+    result = JSON.parse(raw);
+  } catch {
+    return manualReview(response);
+  }
+
+  const validTopic = TOPICS.has(result?.topic);
+  const validDraft = typeof result?.draft === "string" && result.draft.trim() !== "";
+  if (!validTopic || !validDraft) {
+    return manualReview(response);
+  }
+
+  return json(response, 200, { status: "ready", topic: result.topic, draft: result.draft });
 }
 
 createServer(async (request, response) => {
